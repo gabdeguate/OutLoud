@@ -1,0 +1,14 @@
+title = "OutLoud portfolio secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Noncredential JavaScript fetch alias in one runtime test"
+condition = "AND"
+regexTarget = "secret"
+regexes = ["^fetchBefore=globalThis[.]fetch$"]
+paths = ["(^|/)mobile/tests/recording-cues-runtime[.]test[.]mjs$"]

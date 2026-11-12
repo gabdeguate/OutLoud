@@ -1,0 +1,763 @@
+"""Explicit saved-rehearsal coaching. PostgreSQL is the queue authority.
+
+Lock order: deck/attempt (admission only), description set, analysis, feedback job,
+bucket, request/reservation. Description PATCH takes the set lock; revision-aware
+freshness under that same lock fences both submission and completion. No media,
+provider I/O or output normalization under locks. Whisper is never invoked.
+"""
+from dataclasses import replace
+from datetime import timedelta
+import hashlib
+import logging
+import uuid
+
+from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
+
+from ..models import (Attempt, Deck, DescriptionSet, FeedbackAnalysis, FeedbackJob,
+                      FeedbackRequest, FeedbackReservation)
+from . import descriptions as descriptions_service, feedback_provider as provider
+from . import corrections
+from .alignment import align_words
+from .descriptions import (Conflict, StaleClaim, LEASE_SECONDS, _private_database_logging,
+                           effective_retry_at, saved_receipt, uncertain_submission as _uncertain)
+from .feedback import (FeedbackError, Transcript, validated, analysis_source, restore_analysis, json_bytes)
+from .feedback_config import Selection, QuotaPolicy, coaching_digest, check_coaching_versions, enabled, selection_descriptor, assert_selection
+from .feedback_quota import locked_bucket, reserve, cooldown, stop_legacy_gemini_wait, QUOTA_STOPPED_MESSAGE
+
+logger = logging.getLogger(__name__)
+ACTIVE = {'waiting_descriptions', 'queued', 'preparing', 'submitted', 'normalizing', 'waiting_quota'}
+
+
+def profile_selection(deck_id, *, source=None):
+    from .slide_profiles import preferred_selection
+    return preferred_selection(deck_id, source=source)
+
+
+def safe_error(code):
+    if code == 'review_grouping_removed':
+        return {'code': code, 'message': 'Grouped feedback generation is no longer supported.'}
+    if code == 'quota_stopped':
+        return {'code': code, 'message': QUOTA_STOPPED_MESSAGE}
+    # OpenAI Codex, issue #49: safe diagnostics use the existing error shape.
+    messages = {
+        'audio_unavailable': 'Could not validate audio for grading. Retry to check it again.',
+        'audio_missing': 'The saved audio could not be read. Restore access to the recording, then retry grading.',
+        'audio_decode_failed': 'The saved audio could not be decoded. Check that the recording plays, then retry grading.',
+        'audio_measurement_failed': 'Speech measurements could not be completed. Retry grading to check the recording again.',
+        'audio_invalid': 'The recording could not be validated for grading. Check that the recording plays before retrying.',
+        'audio_duration_mismatch': 'Audio and capture durations differ by more than one second. Check the recording before retrying grading.',
+        'insufficient_audio_evidence': 'There is not enough usable speech for grading. Try a recording with more speech.',
+        'review_invalid_evidence': 'The feedback citations could not be verified against this recording and slide. Retry feedback to request a new assessment.',
+        'review_model_error': 'The AI returned feedback we could not process. Retry feedback to request a new assessment.',
+        'review_summary_missing': 'Feedback for this slide is missing. Retry feedback to request a new assessment.',
+    }
+    if code in messages:
+        return {'code': code, 'message': messages[code]}
+    return {'code': code, 'message': f'Rehearsal feedback unavailable ({code}).'} if code else None
+
+
+def _digest(value):
+    return hashlib.sha256(json_bytes(value)).hexdigest()
+
+
+def transcript_identity(attempt):
+    if attempt.transcript is None:
+        return None
+    try:
+        # JSONB reorders object keys. Use the same typed field order as the
+        # evidence adapter, never raw database dict serialization.
+        transcript = validated(Transcript, attempt.transcript).model_dump(mode='json')
+        return _digest([str(attempt.pk), transcript])
+    except FeedbackError:
+        return None
+
+
+def attempt_identity(attempt):
+    return _digest([str(attempt.pk), str(attempt.deck_id), attempt.duration_ms, attempt.slide_events,
+        attempt.audience, attempt.transcript, attempt.visits, attempt.processing_revision,
+        (attempt.metrics or {}).get('detected_language') or 'und', attempt.audio.name, attempt.upload_hash])
+
+
+def correction_input(attempt):
+    value = corrections.snapshot(attempt)
+    if value['source_changed']:
+        raise Conflict('transcript_source_changed')
+    return {'transcript_revision': value['revision'], 'corrections': value['edits'],
+            'effective_text': value['effective_text'], 'correction_analysis_version': corrections.ANALYSIS_VERSION}
+
+
+def prepare_attempt(attempt):
+    """Enumerate BEFORE align_words; copied indexes never come from text matching."""
+    if attempt.analysis_outcome == 'no_speech':
+        raise FeedbackError('no_speech')
+    transcript = attempt.transcript
+    if transcript is None:
+        raise FeedbackError('missing_transcript')
+    try:
+        indexed = [{**w, 'original_index': i} for i, w in enumerate(transcript['words'])]
+        visits = align_words(indexed, attempt.slide_events, attempt.duration_ms)
+        plain = [{**v, 'words': [{k: x for k, x in w.items() if k != 'original_index'} for w in v['words']]} for v in visits]
+        if plain != attempt.visits:
+            raise FeedbackError('invalid_alignment')
+        source = {'attempt_id': str(attempt.pk), 'deck_id': str(attempt.deck_id),
+            'duration_ms': attempt.duration_ms, 'speaker_language': (attempt.metrics or {}).get('detected_language') or 'und',
+            'audience': attempt.audience, 'transcript': transcript,
+            'slides': [{'deck_id': str(attempt.deck_id), 'slide_index': s.slide_index,
+                        'extracted_text': s.extracted_text, 'source_language': 'und'} for s in attempt.deck.slides.all()],
+            'visits': [{k: v[k] for k in ('slide_index', 'start_ms', 'end_ms')} |
+                       {'word_indexes': [w['original_index'] for w in v['words']]} for v in visits]}
+        validated = analysis_source(source)  # Missing/invalid/no speech BEFORE deck preparation/admission.
+        if len(validated.slides) != attempt.deck.page_count:
+            raise FeedbackError('invalid_slides')
+        return source
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise FeedbackError('invalid_transcript') from None
+
+
+def publish(analysis_id, revision):
+    from ..tasks import coach_attempt
+    try:
+        coach_attempt.delay(analysis_id, revision)
+    except Exception:
+        logger.warning('Coaching publish unavailable; durable queue retained.')
+
+
+def _stale(value, job):
+    if job.descriptions_snapshot is not None:
+        return value.description_revision != job.description_revision
+    # Natural completion keeps the dependency generation. PATCH advances it.
+    return value.processing_revision != job.description_generation
+
+
+def _source_current(job):
+    attempt = Attempt.objects.get(pk=job.analysis.attempt_id)
+    value = job.description_set
+    deck = Deck.objects.get(pk=value.deck_id)
+    try:
+        correction = corrections.snapshot(attempt)
+    except FeedbackError:
+        return False
+    if 'audience_qa' in job.source_snapshot:
+        from .audience_qa import current as qa_current
+        if not qa_current(attempt, job.source_snapshot['audience_qa']):
+            return False
+    if 'qa_answer' in job.source_snapshot:
+        from .audience_qa import VERSION
+        if job.source_snapshot['qa_answer']['version'] != VERSION:
+            return False
+    if job.analysis.analysis_type.startswith('score_'):
+        from .presentation_scoring import current
+        if not current(attempt, job):
+            return False
+    if 'slide_review' in job.source_snapshot:
+        from .slide_review import current
+        if not current(attempt, job.source_snapshot['slide_review']):
+            return False
+    return (job.source_snapshot.get('correction_analysis_version', corrections.ANALYSIS_VERSION) == corrections.ANALYSIS_VERSION and
+            not correction['source_changed'] and correction['revision'] == job.source_snapshot.get('transcript_revision', 0) and
+            attempt_identity(attempt) == job.source_snapshot['attempt_identity'] and
+            descriptions_service.storage_identity(deck, list(deck.slides.all())) == value.source_snapshot['storage'])
+
+
+def _locked(analysis_id, revision):
+    owner = FeedbackJob.objects.only('description_set_id').get(analysis_id=analysis_id, generation=revision)
+    value = DescriptionSet.objects.select_for_update().get(pk=owner.description_set_id)
+    analysis = FeedbackAnalysis.objects.select_for_update().get(pk=analysis_id)
+    job = FeedbackJob.objects.select_for_update().get(analysis=analysis, generation=revision)
+    return value, analysis, job
+
+
+def _superseded(value, analysis, job):
+    return analysis.feedback_revision != job.generation or _stale(value, job) or not _source_current(job)
+
+
+def _fresh(value, analysis, job, token):
+    if (_superseded(value, analysis, job) or job.claim_token != token or job.state not in ACTIVE
+            or not job.claimed_at or job.claimed_at <= timezone.now() - timedelta(seconds=LEASE_SECONDS)):
+        raise StaleClaim()
+
+
+def _attach(value, job):
+    # Called only with set and job locks. Copy exact revision, including edits.
+    if value.descriptions is not None and job.descriptions_snapshot is None:
+        job.descriptions_snapshot = value.descriptions
+        if job.analysis.analysis_type.startswith(('review_', 'qa_', 'score_')):
+            # Profiles share descriptions' source/fact schema. Preserve guidance
+            # separately while the legacy adapter validates the common facts.
+            job.source_snapshot = {**job.source_snapshot, 'review_profile': value.descriptions}
+            job.descriptions_snapshot = {'slides': [{k: s[k] for k in ('deck_id', 'slide_index', 'source_id', 'summary', 'key_ideas', 'visual_facts')} for s in value.descriptions['slides']]}
+        job.description_revision = value.description_revision
+        job.state = 'queued'
+        job.source_snapshot = {**job.source_snapshot, 'description_origin': 'edited' if value.edited else 'generated'}
+        job.save(update_fields=['descriptions_snapshot', 'description_revision', 'source_snapshot', 'state', 'updated_at'])
+
+
+@_private_database_logging()
+def generate(attempt_id, payload, analysis_type='coaching', review_scope=None):
+    attempt = Attempt.objects.select_related('deck').get(pk=attempt_id)
+    if analysis_type.startswith('review_'):
+        from . import slide_review
+        review_scope = slide_review.scope_for(attempt, review_scope)
+        if len(review_scope['slides']) != 1:
+            raise Conflict('review_grouping_removed')
+        if analysis_type != slide_review.analysis_type(review_scope):
+            raise FeedbackError('invalid_request')
+    if 'transcript_revision' in payload and payload['transcript_revision'] != corrections.snapshot(attempt)['revision']:
+        raise Conflict('correction_conflict')
+    review_input = None
+    qa_input = None
+    if analysis_type == 'qa_answer':
+        from . import audience_qa
+        qa_input = audience_qa.answer_capture(attempt)
+    elif analysis_type.startswith('qa_'):
+        from . import audience_qa
+        qa_input = audience_qa.capture(attempt, review_scope)
+    if analysis_type.startswith('review_'):
+        from . import slide_review
+        review_input = slide_review.capture(attempt, review_scope)
+    existing = FeedbackAnalysis.objects.filter(attempt=attempt, analysis_type=analysis_type).first()
+    replacement = None
+    if existing:
+        # Same-provider retries retain their snapshot. The explicit OpenRouter
+        # cutover creates a new generation and leaves old requests unchanged.
+        with transaction.atomic():
+            value, analysis, old = _locked(existing.pk, existing.feedback_revision)
+            if 'transcript_revision' in payload and payload['transcript_revision'] != corrections.snapshot(attempt)['revision']:
+                raise Conflict('correction_conflict')
+            if old.generation != analysis.feedback_revision:
+                raise Conflict('stale_revision')
+            replacement = descriptions_service.replacement_selection(value)
+            assert_selection(payload, selection_descriptor(replacement, coaching=True) if replacement else
+                             selection_descriptor(value=value, job=old, coaching=True))
+            revision = payload.get('feedback_revision')
+            if revision is not None and revision != analysis.feedback_revision:
+                raise Conflict('stale_revision')
+            stale = bool(replacement) or _stale(value, old) or not _source_current(old)
+            explicit_recovery = (revision is not None and review_input is not None and
+                                 slide_review.recovery_error(old))
+            if not stale and (old.state in ACTIVE or old.state == 'completed' and not explicit_recovery):
+                return analysis
+            if revision is None:
+                raise Conflict('revision_required')
+            request = FeedbackRequest.objects.filter(coaching_job=old).first()
+            if _uncertain(request) and not payload.get('acknowledge_uncertain'):
+                raise Conflict('confirmation_required')
+            if replacement:
+                if descriptions_service.replacement_requires_confirmation(value, old) and not payload.get('acknowledge_uncertain'):
+                    raise Conflict('confirmation_required')
+                if attempt_identity(attempt) != old.source_snapshot['attempt_identity']:
+                    raise Conflict('source_changed')
+            else:
+                retry_at = effective_retry_at(value, old)
+                if retry_at and retry_at > timezone.now():
+                    raise Conflict('retry_not_available')
+                snapshot = old.source_snapshot
+                if not _source_current(old):
+                    if attempt_identity(attempt) != snapshot['attempt_identity']:
+                        raise Conflict('source_changed')
+                    snapshot = {**snapshot, **correction_input(attempt)}
+                if qa_input is not None:
+                    snapshot = {**snapshot, 'qa_answer' if analysis_type == 'qa_answer' else 'audience_qa': qa_input}
+                if review_input is not None:
+                    snapshot = {**snapshot, 'slide_review': review_input}
+                selection = Selection.saved(value)
+                selection.check_versions(value.prompt_digest)
+                check_coaching_versions(old)
+                selection.credentials()
+                QuotaPolicy.current(selection)
+                return _queue(analysis, value, snapshot, old)
+    initial_controls = {'expected_selection', 'transcript_revision'}
+    if review_input is not None and payload.get('acknowledge_uncertain') is True:
+        # A lost initial reply can reconcile to no server owner. Confirmation
+        # permits that singleton admission; existing-owner retry fences stay above.
+        initial_controls.add('acknowledge_uncertain')
+    if not replacement and set(payload) - initial_controls:  # Revision controls never create an initial analysis.
+        raise Conflict('stale_revision')
+    source = prepare_attempt(attempt)
+    if review_input is None and qa_input is None:
+        assert_selection(payload, selection_descriptor(coaching=True))
+    selection = profile_selection(attempt.deck_id) if review_input is not None or qa_input is not None else Selection.current()
+    assert_selection(payload, selection_descriptor(selection, coaching=True))
+    selection.credentials()
+    QuotaPolicy.current(selection)
+    deck, snapshot = descriptions_service.prepare_saved(attempt.deck_id)
+    prepared = restore_analysis(source, deck)
+    description_request = selection.adapter().prepare_descriptions(deck)
+    captured = {'source': source, 'attempt_identity': attempt_identity(attempt),
+                'analysis_id': prepared.input_id, 'transcript_id': prepared.transcript_id,
+                'chronology_id': _digest([attempt.duration_ms, attempt.slide_events]), **correction_input(attempt)}
+    if 'transcript_revision' in payload and payload['transcript_revision'] != captured['transcript_revision']:
+        raise Conflict('correction_conflict')
+    if qa_input is not None:
+        captured['qa_answer' if analysis_type == 'qa_answer' else 'audience_qa'] = qa_input
+    if review_input is not None:
+        captured['slide_review'] = review_input
+    # The description intent and feedback dependency commit together.
+    with transaction.atomic():
+        locked_deck = Deck.objects.select_for_update().get(pk=attempt.deck_id)
+        current_attempt = Attempt.objects.select_for_update().get(pk=attempt_id)
+        if attempt_identity(current_attempt) != captured['attempt_identity']:
+            raise Conflict('source_changed')
+        if correction_input(current_attempt)['transcript_revision'] != captured['transcript_revision']:
+            raise Conflict('correction_conflict')
+        descriptions_service.check_storage(locked_deck, snapshot)
+        # Serializing initial admission on the deck/attempt also deduplicates a
+        # second caller that observed no analysis before preparing its input.
+        current = FeedbackAnalysis.objects.filter(attempt_id=attempt_id, analysis_type=analysis_type).first()
+        if current:
+            if not replacement:
+                return generate(attempt_id, payload, analysis_type, review_scope)
+            old_value, analysis, old = _locked(current.pk, current.feedback_revision)
+            if payload['feedback_revision'] != analysis.feedback_revision:
+                raise Conflict('stale_revision')
+            if replacement != descriptions_service.replacement_selection(old_value):
+                raise Conflict('selection_mismatch')
+            if descriptions_service.replacement_requires_confirmation(old_value, old) and not payload.get('acknowledge_uncertain'):
+                raise Conflict('confirmation_required')
+        assert_selection(payload, selection_descriptor(profile_selection(attempt.deck_id, source=deck.input_id) if review_input is not None or qa_input is not None else Selection.current(), coaching=True))
+        if qa_input is not None and analysis_type != 'qa_answer' and not audience_qa.current(current_attempt, qa_input):
+            raise Conflict('requirements_changed')
+        if review_input is not None and not slide_review.current(current_attempt, review_input):
+            raise Conflict('requirements_changed')
+        value = descriptions_service.admit_prepared(selection, deck, snapshot, dependency=True, candidate=description_request,
+            replacement_of=old_value if replacement else None)
+        if not current:
+            analysis = FeedbackAnalysis.objects.create(attempt=current_attempt, analysis_type=analysis_type)
+        return _queue(analysis, value, captured)
+
+
+def _queue(analysis, value, snapshot, previous=None):
+    analysis.feedback_revision += 1
+    analysis.save(update_fields=['feedback_revision', 'updated_at'])
+    job = FeedbackJob.objects.create(analysis=analysis, generation=analysis.feedback_revision,
+        description_set=value, description_generation=value.processing_revision, source_snapshot=snapshot,
+        prompt_version=previous.prompt_version if previous else provider.COACHING_PROMPT_VERSION,
+        schema_version=previous.schema_version if previous else provider.current_schema_version(value.provider, 'coaching'),
+        prompt_digest=previous.prompt_digest if previous else coaching_digest(value.provider), queued_at=timezone.now())
+    _attach(value, job)
+    transaction.on_commit(lambda: publish(analysis.pk, job.generation))
+    return analysis
+
+
+def _prepared(value, job):
+    if job.analysis.analysis_type.startswith('score_'):
+        from .presentation_scoring import prepared
+        return prepared(value, job)
+    selection = Selection.saved(value)
+    selection.check_versions(value.prompt_digest)
+    check_coaching_versions(job)
+    deck = descriptions_service.snapshot_deck(value)
+    analysis = restore_analysis(job.source_snapshot['source'], deck)
+    if (analysis.input_id != job.source_snapshot['analysis_id'] or
+            analysis.transcript_id != job.source_snapshot['transcript_id']):
+        raise FeedbackError('snapshot_unavailable')
+    adapter = selection.adapter(coaching_schema_version=job.schema_version)
+    descriptions = adapter.edited_descriptions(analysis, job.descriptions_snapshot)
+    prepared = adapter.prepare_coaching(analysis, descriptions)
+    if job.analysis.analysis_type.startswith('qa_'):
+        from .audience_qa import augment
+        prepared = augment(prepared, job.source_snapshot)
+    elif job.analysis.analysis_type.startswith('review_'):
+        from .slide_review import augment
+        prepared = augment(prepared, job.source_snapshot)
+    elif job.source_snapshot.get('transcript_revision', 0) or job.analysis.analysis_type == 'transcription_suggestions':
+        from .transcript_suggestions import augment_request
+        prepared = augment_request(prepared, job.source_snapshot, job.analysis.analysis_type)
+    if job.input_hash and prepared.input_hash != job.input_hash:
+        raise FeedbackError('snapshot_unavailable')
+    return prepared
+
+
+@_private_database_logging()
+def claim(analysis_id, revision):
+    with transaction.atomic():
+        value, analysis, job = _locked(analysis_id, revision)
+        request = FeedbackRequest.objects.select_for_update().filter(coaching_job=job).first()
+        if _superseded(value, analysis, job):
+            if (not request or not request.received_at or request.completed_at or
+                    (job.claim_token and job.claimed_at and job.claimed_at > timezone.now() - timedelta(seconds=LEASE_SECONDS))):
+                return None
+            job.claim_token, job.claimed_at = uuid.uuid4(), timezone.now()
+            job.save(update_fields=['claim_token', 'claimed_at', 'updated_at'])
+            return value, job, request
+        if job.state == 'waiting_descriptions':
+            _attach(value, job)
+        if job.claim_token:
+            return None
+        if stop_legacy_gemini_wait(value.provider, job, request):
+            return None
+        if job.state != 'queued' and not (job.state == 'waiting_quota' and request and request.received_at):
+            return None
+        if request and (request.completed_at or (request.submitted_at and not request.received_at)):
+            return None
+        job.claim_token, job.claimed_at = uuid.uuid4(), timezone.now()
+        job.state = 'normalizing' if request and request.received_at else 'preparing'
+        job.save(update_fields=['claim_token', 'claimed_at', 'state', 'updated_at'])
+        if request and not request.submitted_at:
+            request.claim_token, request.claimed_at = job.claim_token, job.claimed_at
+            request.save(update_fields=['claim_token', 'claimed_at'])
+        return value, job, request
+
+
+@_private_database_logging()
+def submit(value, job, prepared):
+    """Persistence failure propagates to lease recovery, NEVER to another call."""
+    with transaction.atomic():
+        current, analysis, locked_job = _locked(job.analysis_id, job.generation)
+        _fresh(current, analysis, locked_job, job.claim_token)
+        if 'slide_review' in locked_job.source_snapshot:
+            from .slide_review import check_snapshot
+            check_snapshot(locked_job.source_snapshot['slide_review'])
+        selection = Selection.saved(current)
+        bucket = locked_bucket(selection)
+        selection.check_versions(current.prompt_digest)
+        check_coaching_versions(locked_job)
+        if (prepared.analysis.input_id != locked_job.source_snapshot['analysis_id'] or
+                prepared.descriptions.model_dump(mode='json') != locked_job.descriptions_snapshot or
+                (locked_job.input_hash and prepared.input_hash != locked_job.input_hash)):
+            raise FeedbackError('snapshot_unavailable')
+        descriptions_service.check_storage(Deck.objects.get(pk=current.deck_id), current.source_snapshot)
+        config, policy = selection.credentials(), QuotaPolicy.current(selection)
+        request, _ = FeedbackRequest.objects.get_or_create(coaching_job=locked_job, defaults={
+            'generation': locked_job.generation, 'claim_token': locked_job.claim_token,
+            'provider': current.provider, 'project_id': current.project_id, 'model': current.model, 'stage': 'coaching',
+            'input_hash': prepared.input_hash, 'queued_at': locked_job.queued_at, 'claimed_at': locked_job.claimed_at})
+        if request.submitted_at or request.claim_token != job.claim_token or request.input_hash != prepared.input_hash:
+            raise StaleClaim()
+        _fresh(current, analysis, locked_job, job.claim_token)
+        reserve(bucket, request, len(prepared.payload) + provider.output_token_limit(prepared), policy)
+        request.submitted_at, request.outcome = timezone.now(), 'submitted'
+        request.save(update_fields=['submitted_at', 'outcome'])
+        locked_job.input_hash, locked_job.state = prepared.input_hash, 'submitted'
+        locked_job.save(update_fields=['input_hash', 'state', 'updated_at'])
+    # Return a committed request identity; no I/O occurs before this boundary.
+    return replace(prepared, config=config), request
+
+
+@_private_database_logging()
+def save_receipt(value, job, request, receipt, *, credential=None):
+    if credential and credential.encode('ascii') in receipt.body:
+        receipt = replace(receipt, body=receipt.body.replace(credential.encode('ascii'), b''),
+                          body_complete=False, body_issue='credential_redacted')
+    with transaction.atomic():
+        current, analysis, old_job = _locked(job.analysis_id, job.generation)
+        bucket = locked_bucket(Selection.saved(current))
+        record = FeedbackRequest.objects.select_for_update().get(pk=request.pk)
+        if (not record.submitted_at or record.claim_token != request.claim_token or
+                (receipt.provider, receipt.model, receipt.stage, receipt.input_hash) !=
+                (record.provider, record.model, record.stage, record.input_hash) or len(receipt.body) > provider.MAX_RESPONSE_BYTES):
+            raise FeedbackError('receipt_mismatch', uncertain=True)
+        if record.received_at:
+            return saved_receipt(record)
+        record.raw_body, record.status_code = receipt.body, receipt.status_code
+        record.body_complete, record.body_issue = receipt.body_complete, receipt.body_issue
+        record.retry_at, record.usage = receipt.retry_at, dict(receipt.usage) or None
+        record.received_at, record.outcome, record.completed_at = timezone.now(), 'received', None
+        record.save(update_fields=['raw_body', 'status_code', 'body_complete', 'body_issue', 'retry_at', 'usage',
+                                   'received_at', 'outcome', 'completed_at'])
+        if receipt.status_code == 429:
+            cooldown(bucket, receipt.retry_at)
+        if (not _superseded(current, analysis, old_job) and
+                (old_job.state == 'needs_confirmation' or (old_job.claimed_at and
+                 old_job.claimed_at <= timezone.now() - timedelta(seconds=LEASE_SECONDS)))):
+            old_job.state, old_job.claim_token, old_job.completed_at = 'queued', None, None
+            old_job.save(update_fields=['state', 'claim_token', 'completed_at', 'updated_at'])
+            transaction.on_commit(lambda: publish(analysis.pk, old_job.generation))
+    return receipt
+
+
+@_private_database_logging()
+def finish(value, job, result=None, error=None):
+    with transaction.atomic():
+        current, analysis, locked_job = _locked(job.analysis_id, job.generation)
+        request = FeedbackRequest.objects.select_for_update().filter(coaching_job=locked_job).first()
+        try:
+            _fresh(current, analysis, locked_job, job.claim_token)
+            fresh = True
+        except StaleClaim:
+            fresh = False
+        superseded = _superseded(current, analysis, locked_job)
+        if not fresh:
+            if not superseded:
+                return
+            if locked_job.claim_token:
+                if (locked_job.claim_token != job.claim_token or not locked_job.claimed_at or
+                        locked_job.claimed_at <= timezone.now() - timedelta(seconds=LEASE_SECONDS)):
+                    return
+            elif not request or request.claim_token != job.claim_token:
+                return
+        waiting = error and error.code == 'waiting_quota' and (not request or not request.submitted_at)
+        uncertain = bool(error and error.uncertain)
+        if error and request and request.submitted_at and not request.received_at:
+            uncertain = error.uncertain or error.code not in {'invalid_request', 'request_too_large', 'invalid_destination', 'missing_api_key', 'invalid_configuration'}
+        if request and not request.completed_at and (request.claim_token == job.claim_token or request.received_at):
+            request.outcome = ('local' if not request.submitted_at else 'uncertain' if uncertain else
+                'rejected' if error and request.status_code and request.status_code != 200 else
+                'invalid' if error or (result and result.state == 'all_invalid') else 'completed')
+            request.error_code = error.code if error else 'unsupported_feedback' if result and result.state == 'all_invalid' else ''
+            request.completed_at = None if waiting else timezone.now()
+            request.save(update_fields=['outcome', 'error_code', 'completed_at'])
+        if not fresh:
+            if locked_job.claim_token == job.claim_token:
+                locked_job.claim_token = None
+                locked_job.save(update_fields=['claim_token', 'updated_at'])
+            return  # Late receipt/usage is final, newer result/edit is untouched.
+        if result is not None:
+            locked_job.result = {'status': result.state, 'accepted_count': result.accepted_count,
+                'discarded_count': result.discarded_count,
+                'suggestions': [s.model_dump(mode='json') for s in result.suggestions]}
+            if hasattr(result, 'presentation_score'):
+                locked_job.result['presentation_score'] = result.presentation_score
+                locked_job.result['private_audit'] = result.private_audit
+            if hasattr(result, 'questions'):
+                locked_job.result['questions'] = result.questions
+                locked_job.result['answer'] = result.answer
+            if hasattr(result, 'slides'):
+                locked_job.result['slides'] = result.slides
+            if hasattr(result, 'validation_revision'):
+                locked_job.result['validation_revision'] = result.validation_revision
+            if result.state == 'all_invalid':
+                error = FeedbackError('unsupported_feedback')
+        locked_job.state = 'waiting_quota' if waiting else 'needs_confirmation' if uncertain else 'failed' if error else 'completed'
+        locked_job.error_code = error.code if error else ''
+        locked_job.retry_at = error.retry_at if error else None
+        locked_job.completed_at = None if waiting else timezone.now()
+        locked_job.claim_token = None
+        locked_job.save(update_fields=['result', 'state', 'error_code', 'retry_at', 'completed_at', 'claim_token', 'updated_at'])
+
+
+@_private_database_logging()
+def run_coaching(analysis_id, revision):
+    try:
+        claimed = claim(analysis_id, revision)
+    except (FeedbackAnalysis.DoesNotExist, FeedbackJob.DoesNotExist):
+        return
+    if claimed is None:
+        return
+    value, job, request = claimed
+    result, safe = None, None
+    try:
+        prepared = _prepared(value, job)
+        if request and request.received_at:
+            receipt = saved_receipt(request)  # No credentials/media/provider required.
+        else:
+            try:
+                prepared, request = submit(value, job, prepared)
+            except (FeedbackError, StaleClaim):
+                raise
+            except Exception:
+                logger.warning('Coaching submission persistence unavailable; recovery required.')
+                return
+            receipt = provider.request_raw(prepared)
+            try:
+                receipt = save_receipt(value, job, request, receipt, credential=prepared.config.key)
+            except Exception:
+                logger.warning('Coaching receipt could not be saved; recovery required.')
+                return
+        if job.analysis.analysis_type.startswith('score_'):
+            from .presentation_scoring import normalize
+            result = normalize(value, job, prepared, receipt)
+        elif job.analysis.analysis_type.startswith('qa_'):
+            from .audience_qa import normalize
+            result = normalize(prepared, receipt, job.source_snapshot)
+        elif job.analysis.analysis_type.startswith('review_'):
+            from .slide_review import normalize
+            result = normalize(prepared, receipt, job.source_snapshot)
+        elif job.analysis.analysis_type == 'transcription_suggestions':
+            from .transcript_suggestions import normalize_suggestions
+            result = normalize_suggestions(prepared, receipt, job.source_snapshot)
+        else:
+            result = provider.normalize(prepared, receipt)
+    except StaleClaim:
+        return
+    except Exception as error:
+        safe = error if isinstance(error, FeedbackError) else FeedbackError('processing_failed')
+    try:
+        finish(value, job, result=result, error=safe)
+    except Exception:
+        logger.warning('Coaching state could not be saved; recovery required.')
+
+
+@_private_database_logging()
+def recover_coaching():
+    ids = FeedbackJob.objects.filter(Q(state__in=ACTIVE) |
+        Q(request__received_at__isnull=False, request__completed_at__isnull=True)).values_list('analysis_id', 'generation')
+    for analysis_id, revision in ids.iterator():
+        with transaction.atomic():
+            value, analysis, job = _locked(analysis_id, revision)
+            now = timezone.now()
+            if (job.claim_token and job.claimed_at and job.claimed_at > now - timedelta(seconds=LEASE_SECONDS)):
+                continue
+            request = FeedbackRequest.objects.select_for_update().filter(coaching_job=job).first()
+            unfinished = request and request.received_at and not request.completed_at
+            if _superseded(value, analysis, job):
+                if unfinished:
+                    transaction.on_commit(lambda id=analysis_id, rev=revision: publish(id, rev))
+                elif request and request.submitted_at and not request.received_at and request.outcome == 'submitted':
+                    request.outcome, request.completed_at = 'uncertain', now
+                    request.save(update_fields=['outcome', 'completed_at'])
+                if not unfinished and job.state in ACTIVE:
+                    job.state, job.claim_token = 'superseded', None
+                    job.save(update_fields=['state', 'claim_token', 'updated_at'])
+                continue
+            if job.state not in ACTIVE and not unfinished:
+                continue
+            if job.state == 'waiting_descriptions':
+                _attach(value, job)
+                if job.state == 'waiting_descriptions':
+                    continue  # Failed dependencies have their own explicit retry.
+            previous = (job.state, job.claim_token, job.error_code, job.completed_at)
+            if request and request.submitted_at and not request.received_at:
+                request.outcome, request.completed_at = 'uncertain', now
+                request.save(update_fields=['outcome', 'completed_at'])
+                job.state, job.error_code, job.completed_at = 'needs_confirmation', 'uncertain_submission', now
+            elif request and request.completed_at:
+                job.state = 'needs_confirmation' if request.outcome == 'uncertain' else 'failed'
+                job.error_code, job.completed_at = request.error_code or 'processing_failed', now
+            elif request and request.received_at:
+                job.state = 'queued'  # Normalize saved evidence regardless of an old wait marker.
+            elif stop_legacy_gemini_wait(value.provider, job, request):
+                continue
+            elif job.state == 'waiting_quota' and job.retry_at and job.retry_at > now:
+                continue
+            else:
+                if request and not request.submitted_at:
+                    FeedbackReservation.objects.filter(request=request, submitted_at__isnull=True,
+                        released_at__isnull=True).update(released_at=now)
+                job.state = 'queued'
+            job.claim_token = None
+            if (job.state, job.claim_token, job.error_code, job.completed_at) != previous:
+                job.save(update_fields=['state', 'claim_token', 'error_code', 'completed_at', 'updated_at'])
+            if job.state == 'queued':
+                transaction.on_commit(lambda id=analysis_id, rev=revision: publish(id, rev))
+
+
+def _availability(selection=None):
+    try:
+        enabled()
+        selection = selection or Selection.current()
+        selection.credentials()
+        QuotaPolicy.current(selection)
+        return {'state': 'available', 'error': None}
+    except FeedbackError as error:
+        return {'state': 'disabled' if error.code == 'disabled' else 'unavailable', 'error': safe_error(error.code)}
+
+
+def _provenance(value, job):
+    return {**Selection.saved(value).scope(), 'coaching_prompt_version': job.prompt_version,
+            'coaching_schema_version': job.schema_version}
+
+
+def _result(value, job, current_job):
+    if not job or job.result is None:
+        return None
+    if job.analysis.analysis_type.startswith('score_'):
+        from .presentation_scoring import public_result
+        return public_result(value, job, current_job)
+    source = job.source_snapshot['source']
+    extra = {}
+    if 'audience_qa' in job.source_snapshot or 'qa_answer' in job.source_snapshot:
+        extra = {'questions':job.result.get('questions', []), 'answer':job.result.get('answer'),
+                 'qa_version':job.source_snapshot.get('audience_qa',job.source_snapshot.get('qa_answer'))['version'],
+                 'job_id':job.pk}
+    if 'slide_review' in job.source_snapshot:
+        extra = {'slides': job.result.get('slides', []), 'review_version': job.source_snapshot['slide_review']['version'],
+                 'validation_revision':job.result.get('validation_revision','legacy')}
+    return {**extra, **{k: job.result[k] for k in ('status', 'accepted_count', 'discarded_count', 'suggestions')},
+        'message': 'No supported suggestions.' if job.result['status'] == 'empty' else None,
+        'feedback_revision': job.generation, 'description_set_id': str(value.pk),
+        'description_revision': job.description_revision, 'provenance': _provenance(value, job),
+        'description_origin': job.source_snapshot.get('description_origin') if job.source_snapshot.get('description_origin') in {'generated', 'edited'} else 'unavailable',
+        'completed_at': job.completed_at, 'stale': job.pk != current_job.pk or bool(descriptions_service.replacement_selection(value)) or _stale(value, job) or not _source_current(job),
+        'transcript_revision': job.source_snapshot.get('transcript_revision', 0),
+        'analysis_type': job.analysis.analysis_type, 'analysis_version': job.source_snapshot.get('correction_analysis_version', 'legacy'),
+        'evidence': {'attempt_id': source['attempt_id'], 'deck_id': source['deck_id'],
+            'transcript_id': job.source_snapshot['transcript_id'], 'chronology_id': job.source_snapshot['chronology_id'],
+            'duration_ms': source['duration_ms'], 'page_count': len(source['slides']),
+            'audience_supplied': bool(source['audience'].strip()),
+            'visits': source['visits'], 'sources': [{'slide_index': i, 'source_id': sid}
+                for i, sid in enumerate(value.source_snapshot['source_ids'])],
+            'descriptions': job.descriptions_snapshot}}
+
+
+def read(attempt_id, analysis_type='coaching'):
+    while True:
+        try:
+            return _read(attempt_id, analysis_type)
+        except StaleClaim:
+            # Release old-scope locks before reading a replacement generation.
+            continue
+
+
+@_private_database_logging()
+def _read(attempt_id, analysis_type='coaching'):
+    Attempt.objects.only('id').get(pk=attempt_id)
+    analysis = FeedbackAnalysis.objects.filter(attempt_id=attempt_id, analysis_type=analysis_type).first()
+    if analysis is None:
+        availability = _availability()
+        return {'attempt_id': str(attempt_id), 'feedback_revision': 0,
+            'state': 'absent' if availability['state'] == 'available' else availability['state'],
+            'selection': selection_descriptor(coaching=True),
+            'stage': None, 'availability': availability, 'provenance': None, 'description_set_id': None,
+            'description_revision': None, 'dependency': None, 'created_at': None, 'updated_at': None,
+            'queued_at': None, 'claimed_at': None, 'submitted_at': None, 'received_at': None, 'completed_at': None,
+            'retry_at': None, 'retry_available': False, 'requires_confirmation': False, 'stale': False,
+            'error': availability['error'], 'result': None, 'last_output': None}
+    with transaction.atomic():
+        value, analysis, job = _locked(analysis.pk, analysis.feedback_revision)
+        # A provider cutover can advance to another immutable description set.
+        # Restart outside this transaction rather than pair it with the old set.
+        if job.generation != analysis.feedback_revision:
+            raise StaleClaim()
+        request = FeedbackRequest.objects.filter(coaching_job=job).first()
+        replacement = descriptions_service.replacement_selection(value)
+        stale = bool(replacement) or _stale(value, job) or not _source_current(job)
+        state = 'stale' if stale else job.state
+        retry_at = None if replacement else effective_retry_at(value, job)
+        dependency = None
+        if job.descriptions_snapshot is None:
+            dep = descriptions_service.public_state(value.deck_id, value, source=value.source_fingerprint)
+            dependency = {k: dep[k] for k in ('deck_id', 'description_set_id', 'state', 'processing_revision',
+                'description_revision', 'updated_at', 'error', 'retry_at', 'retry_available', 'requires_confirmation')}
+            dependency['retry_action'] = 'generate_descriptions' if dep['retry_available'] or dep['state'] in {'failed', 'needs_confirmation'} else None
+        prior = job if job.result and job.result['status'] != 'all_invalid' else analysis.jobs.filter(
+            result__isnull=False).exclude(result__status='all_invalid').order_by('-generation').first()
+        if prior is None and job.result:
+            prior = job
+        result = _result(value, prior, job) if prior is None or prior.description_set_id == value.pk else None
+        error = job.error_code or ('descriptions_changed' if stale else '')
+        recovery_error = None
+        if analysis.analysis_type.startswith('review_'):
+            from .slide_review import recovery_error as review_recovery_error
+            recovery_error = review_recovery_error(job)
+            if recovery_error == 'review_summary_missing' or (prior and
+                    review_recovery_error(prior) == 'review_summary_missing'):
+                result = None  # Keep a malformed saved summary out of the public parser; retain its receipt.
+            if recovery_error and not error:
+                error = recovery_error
+        if dependency and dependency['error'] and not error:
+            error = 'description_dependency_failed'
+        # A current-generation receipt can resolve uncertainty after an edit
+        # without touching the stale job. Old generations' receipts must not
+        # advance this snapshot's freshness or resurrect cached confirmation.
+        updates = [job.updated_at, value.updated_at]
+        if request:
+            updates.extend(t for t in (request.received_at, request.completed_at) if t is not None)
+        return {'attempt_id': str(attempt_id), 'feedback_revision': analysis.feedback_revision,
+            'transcript_revision': job.source_snapshot.get('transcript_revision', 0),
+            'analysis_type': analysis.analysis_type, 'analysis_version': job.source_snapshot.get('correction_analysis_version', 'legacy'),
+            'state': state, 'stage': 'descriptions' if job.descriptions_snapshot is None else 'coaching',
+            'selection': selection_descriptor(replacement, coaching=True) if replacement else selection_descriptor(value=value, job=job, coaching=True),
+            'availability': _availability(replacement or Selection.saved(value)), 'provenance': _provenance(value, job),
+            'description_set_id': str(value.pk), 'description_revision': job.description_revision,
+            'dependency': dependency, 'created_at': analysis.created_at,
+            'updated_at': max(updates),
+            'queued_at': job.queued_at, 'claimed_at': job.claimed_at, 'submitted_at': request.submitted_at if request else None,
+            'received_at': request.received_at if request else None, 'completed_at': job.completed_at,
+            'retry_at': retry_at, 'retry_available': (state in {'failed', 'needs_confirmation', 'stale'} or bool(recovery_error)) and
+                (not retry_at or retry_at <= timezone.now()),
+            'requires_confirmation': bool(request and (request.outcome == 'uncertain' or (stale and _uncertain(request)))) or
+                bool(replacement and descriptions_service.replacement_requires_confirmation(value, job)), 'stale': stale, 'error': safe_error(error),
+            'result': result, 'last_output': {k: job.result[k] for k in ('status', 'accepted_count', 'discarded_count')} if job.result else None}

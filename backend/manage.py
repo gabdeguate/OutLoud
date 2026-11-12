@@ -1,0 +1,11 @@
+#!/usr/bin/env python
+# AI-generated/modified with OpenAI Codex, Iteration 1 (2026-09-26 to 2026-10-09).
+# Attribution/review scope: docs/history/ai-collaboration-validation-iteration-1-retired-2026-10-09.md#ai-code-markers
+import os
+import sys
+
+if __name__ == "__main__":
+    os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+    from django.core.management import execute_from_command_line
+
+    execute_from_command_line(sys.argv)
